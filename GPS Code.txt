@@ -1,0 +1,149 @@
+library(data.table)
+library(randomForest)
+
+#Upload data
+tracks = as.data.frame(fread("/Users/Nick/Desktop/MetronProject/GPS/go_track_tracks.csv"))
+trackpoints = as.data.frame(fread("/Users/Nick/Desktop/MetronProject/GPS/go_track_trackspoints.csv"))
+#Order trackpoints by track_id
+trackpoints = trackpoints[order(trackpoints$track_id),]
+#Delete repeated rows (30/31 and 55/56)
+trackpoints = trackpoints[!(trackpoints$track_id==56 | trackpoints$track_id==31),]
+tracks = tracks[!(tracks$id==56 | tracks$id == 31),]
+#Variable not needed
+tracks$linha = NULL
+
+#Add number of trackpoints for each tracks instance
+tracks$count = 0
+for(i in 1:nrow(tracks)) {
+  tracks$count[i] = nrow(trackpoints[trackpoints$track_id==tracks$id[i],])
+}
+#Get just first at last trackpoints for each instance
+tokeep = c(1)
+for(i in 2:nrow(trackpoints)-1) {
+  if(trackpoints$track_id[i] != trackpoints$track_id[i+1]) {
+    tokeep = c(tokeep, i, i+1)
+  }
+}
+tokeep = c(tokeep, nrow(trackpoints))
+firstlast = trackpoints[tokeep,]
+firstlast = unique(firstlast)
+
+#Calculate euclidean distance between trackpoints
+tracks$edist = tracks$distance
+for(i in 1:nrow(tracks)) {
+  if(tracks$count[i] == 1) {
+    next
+  } 
+  else{
+    temp = firstlast[firstlast$track_id==tracks$id[i],c("latitude","longitude")]
+    tracks$edist[i] = dist(temp)
+  }
+}
+
+#Calculate time and distance differentials. Calculate speed.
+trackpoints$timeformat = strptime(trackpoints$time, format = "%Y-%m-%d %H:%M:%S", tz="GMT")
+trackpoints$timediff = trackpoints$dist = trackpoints$speed = 0
+for(i in 2:nrow(trackpoints)) {
+  if(trackpoints$track_id[i] == trackpoints$track_id[i-1]) {
+    trackpoints$timediff[i] = trackpoints$timeformat[i]-trackpoints$timeformat[i-1]
+    temp = trackpoints[c(i,i-1),c("latitude","longitude")]
+    trackpoints$dist[i] = dist(temp)
+    trackpoints$speed[i] = trackpoints$dist[i]/trackpoints$timediff[i]
+  }
+}
+trackpoints = na.omit(trackpoints)
+trackpoints$speed = trackpoints$speed*1000
+tempAvgs = aggregate(.~track_id,data=test3,mean) 
+tracks$avgSpeed = tempAvgs$speed
+
+#Get quantile data for speed
+tracks$numLowSpeeds = 10
+count = 0
+quant25 = quantile(trackpoints$speed)[2]
+for(i in 2:nrow(trackpoints)) {
+  if(trackpoints$track_id[i] == trackpoints$track_id[i-1]) {
+    if(trackpoints$speed[i]<quant25) {
+      count = count + 1
+    }
+  }
+  else { 
+    tracks$numLowSpeeds[which(tracks$id==trackpoints$track_id[i-1])] = count
+    count = 0
+  }
+}
+
+### Data ready, begin model building
+#Fix data
+forRF = tracks
+forRF$rating = as.factor(forRF$rating)
+forRF$id = NULL
+forRF$car_or_bus = forRF$rating_weather = NULL
+colnames(forRF) = c("phoneType","speed","time","distance","rating",
+                    "rating_bus","numTraj","displace","avgSpeed","slowPoints")
+forRF$slowPoints = forRF$phoneType = NULL
+forRF$distance = NULL
+forRF$speed = NULL
+#A single random forest
+set.seed(1)
+trainRows = c(sample(nrow(forRF), round(nrow(forRF)*.75)))
+trainData = forRF[trainRows,]
+testData = forRF[-trainRows,]
+rf = randomForest(rating~., data = trainData)
+rf
+testResults = predict(rf,testData)
+1-sum(testResults==testData$rating)/nrow(testData)
+#10-fold cross-validation
+set.seed(1)
+results = c()
+allConfusion = c()
+for(i in 1:10) {
+  forRF<-forRF[sample(nrow(forRF)),]
+  folds <- cut(seq(1,nrow(forRF)),breaks=10,labels=FALSE)
+  for(i in 1:10){
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    testData <- forRF[testIndexes, ]
+    trainData <- forRF[-testIndexes, ]
+    rf = randomForest(rating~., data = trainData)
+    rf
+    testResults = predict(rf,testData)
+    results = c(results, sum(testResults==testData$rating)/nrow(testData))
+    confusion = rf$confusion[,c(1:3)]
+    temp = (sum(confusion)-sum(diag(confusion)))/sum(confusion)
+    allConfusion = c(allConfusion, 1-temp)
+  }
+}  
+1-mean(results)
+1-mean(allConfusion)
+#Monte Carlo random sampling
+results = c()
+for(i in 1:100) {
+  trainRows = c(sample(nrow(forRF), round(nrow(forRF)*.75)))
+  trainData = forRF[trainRows,]
+  testData = forRF[-trainRows,]
+  rf = randomForest(rating~., data = trainData)
+  testResults = predict(rf,testData)
+  sum(testResults==testData$rating)/nrow(testData)
+}
+mean(results)
+
+
+
+### Figures for powerpoint
+test = trackpoints[trackpoints$track_id==38077,]
+plot(test$latitude,test$longitude, xlab="latitude",ylab="longitude")
+test3 = firstlast[firstlast$track_id==38077,]
+segments(test3[1,2],test3[1,3],test3[2,2],test3[2,3])
+varImpPlot(rf,main="Variable Importance")
+#Variable Importance with random attribute
+set.seed(10)
+rfRand = forRF
+rfRand$random = rnorm(nrow(rfRand))
+trainRows = c(sample(nrow(rfRand), round(nrow(rfRand)*.75)))
+trainData = rfRand[trainRows,]
+testData = rfRand[-trainRows,]
+rf = randomForest(rating~., data = trainData)
+rf
+testResults = predict(rf,testData)
+1-sum(testResults==testData$rating)/nrow(testData)
+varImpPlot(rf,main="Variable Importance")
+abline(v=rf$importance[4], col="red")
